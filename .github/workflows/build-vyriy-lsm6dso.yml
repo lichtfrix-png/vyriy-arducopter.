@@ -1,0 +1,144 @@
+name: VYRIY F405 V5.1 - native LSM6DSO bench build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch ArduPilot 4.7.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          git clone --branch Copter-4.7.2 --depth 1 https://github.com/ArduPilot/ardupilot.git ardupilot
+          cd ardupilot
+          git submodule update --init --recursive
+          git rev-parse HEAD | tee ../logs/source-commit.txt
+
+      - name: Install ARM compiler and build dependencies
+        shell: bash
+        env:
+          DO_AP_STM_ENV: '1'
+          DO_PYTHON_VENV_ENV: '1'
+          SKIP_AP_COMPLETION_ENV: '1'
+          SKIP_AP_GIT_CHECK: '1'
+        run: |
+          set -euo pipefail
+          cd ardupilot
+          bash Tools/environment_install/install-prereqs-ubuntu.sh -y > ../logs/prerequisites.log 2>&1
+          compiler=$(find "$HOME/opt" /opt -type f -name arm-none-eabi-gcc -print -quit 2>/dev/null || true)
+          if [ -z "$compiler" ]; then compiler=$(command -v arm-none-eabi-gcc || true); fi
+          if [ -z "$compiler" ]; then echo 'ARM compiler missing' >&2; exit 1; fi
+          echo "$(dirname "$compiler")" >> "$GITHUB_PATH"
+          "$compiler" --version | head -1
+
+      - name: Install independent LSM6DSO driver and VYRIY hardware definition
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/vyriy_lsm6dso_patch.py <<'PYCODE'
+          from pathlib import Path
+          import base64
+          root=Path('ardupilot').resolve()
+          ins=root/'libraries/AP_InertialSensor'
+
+          def replace_once(path, original, replacement):
+              old=path.read_text(encoding='utf8')
+              hits=old.count(original)
+              if hits != 1:
+                  raise RuntimeError(f'{path}: expected one instance of {original!r}; found {hits}')
+              path.write_text(old.replace(original, replacement, 1), encoding='utf8')
+
+          (ins/'AP_InertialSensor_LSM6DSO.h').write_bytes(base64.b64decode('I3ByYWdtYSBvbmNlCgovLyBJbmRlcGVuZGVudCBMU002RFNPIElNVSBiYWNrZW5kIGZvciBBcmR1UGlsb3QgQ29wdGVyLTQuNy4yLgovLyBQcm90b3R5cGUgb25seTogbmVlZHMgYmVuY2ggdmFsaWRhdGlvbiwgbm90IGZsaWdodCBhcHByb3ZlZC4KCiNpbmNsdWRlIDxBUF9IQUwvQVBfSEFMLmg+CiNpbmNsdWRlIDxBUF9IQUwvU1BJRGV2aWNlLmg+CiNpbmNsdWRlICJBUF9JbmVydGlhbFNlbnNvci5oIgojaW5jbHVkZSAiQVBfSW5lcnRpYWxTZW5zb3JfQmFja2VuZC5oIgoKY2xhc3MgQVBfSW5lcnRpYWxTZW5zb3JfTFNNNkRTTyA6IHB1YmxpYyBBUF9JbmVydGlhbFNlbnNvcl9CYWNrZW5kIHsKcHVibGljOgogICAgfkFQX0luZXJ0aWFsU2Vuc29yX0xTTTZEU08oKSBvdmVycmlkZSA9IGRlZmF1bHQ7CiAgICBzdGF0aWMgQVBfSW5lcnRpYWxTZW5zb3JfQmFja2VuZCAqcHJvYmUoQVBfSW5lcnRpYWxTZW5zb3IgJmltdSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgQVBfSEFMOjpPd25QdHI8QVBfSEFMOjpEZXZpY2U+IGRldmljZSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZW51bSBSb3RhdGlvbiByb3RhdGlvbik7CiAgICB2b2lkIHN0YXJ0KCkgb3ZlcnJpZGU7CiAgICBib29sIHVwZGF0ZSgpIG92ZXJyaWRlOwoKcHJpdmF0ZToKICAgIEFQX0luZXJ0aWFsU2Vuc29yX0xTTTZEU08oQVBfSW5lcnRpYWxTZW5zb3IgJmltdSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgQVBfSEFMOjpPd25QdHI8QVBfSEFMOjpEZXZpY2U+IGRldmljZSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZW51bSBSb3RhdGlvbiByb3RhdGlvbik7CiAgICBib29sIGhhcmR3YXJlX2luaXQoKTsKICAgIGJvb2wgcmVhZF9yZWcodWludDhfdCByZWcsIHVpbnQ4X3QgJnZhbHVlKTsKICAgIGJvb2wgd3JpdGVfcmVnKHVpbnQ4X3QgcmVnLCB1aW50OF90IHZhbHVlLCBib29sIGNoZWNrZWQgPSBmYWxzZSk7CiAgICB2b2lkIHBvbGxfZGF0YSgpOwoKICAgIEFQX0hBTDo6T3duUHRyPEFQX0hBTDo6RGV2aWNlPiBkZXY7CiAgICBlbnVtIFJvdGF0aW9uIHJvdDsKICAgIHN0YXRpYyBjb25zdGV4cHIgdWludDE2X3QgU0FNUExFX1JBVEUgPSA4MzM7CiAgICBzdGF0aWMgY29uc3RleHByIGZsb2F0IEdZUk9fU0NBTEUgPSAwLjA3MGYgKiBERUdfVE9fUkFEOyAvLyAyMDAwIGRwczogNzAgbWRwcy9MU0IKICAgIHN0YXRpYyBjb25zdGV4cHIgZmxvYXQgQUNDRUxfU0NBTEUgPSAwLjAwMDQ4OGYgKiBHUkFWSVRZX01TUzsgLy8gMTZnOiAwLjQ4OCBtZy9MU0IKICAgIGZsb2F0IHRlbXBlcmF0dXJlX2RlZ2MgPSAyNS4wZjsKICAgIHVpbnQ4X3QgdGVtcF9jb3VudGVyID0gMDsKfTsK'))
+          (ins/'AP_InertialSensor_LSM6DSO.cpp').write_bytes(base64.b64decode('LyoKICogTFNNNkRTTyAoV0hPX0FNX0kgMHg2QykgZHJpdmVyIGZvciBBcmR1UGlsb3QgNC43LjIsIFZZUklZIEY0MDUgVjUuMS4KICogQmFzZWQgb24gU1QgTFNNNkRTTyByZWdpc3RlciBkb2N1bWVudGF0aW9uIGFuZCBCZXRhZmxpZ2h0IDQuNS40J3MKICogYWNjZ3lyb19zcGlfbHNtNmRzb19pbml0LmMgY29uZmlndXJhdGlvbjsgb3JpZ2luYWwgQXJkdVBpbG90IGJhY2tlbmQuCiAqCiAqIERJQUdOT1NUSUMgLyBCRU5DSCBPTkxZLiBEaXJlY3QtcmVnaXN0ZXIgc2FtcGxpbmcgYXQgODMzSHosIG5vIEZJRk8uCiAqIE5vdCBhIGRyb3AtaW4gZmxpZ2h0LWNlcnRpZmllZCByZXBsYWNlbWVudCBmb3IgYSBoaWdoLXJhdGUgRklGTyBkcml2ZXIuCiAqLwojaW5jbHVkZSAiQVBfSW5lcnRpYWxTZW5zb3JfTFNNNkRTTy5oIgojaW5jbHVkZSA8QVBfSEFML0dQSU8uaD4KI2luY2x1ZGUgPHV0aWxpdHk+CgpleHRlcm4gY29uc3QgQVBfSEFMOjpIQUwmIGhhbDsKCm5hbWVzcGFjZSB7CmNvbnN0ZXhwciB1aW50OF90IFdIT19BTV9JICAgICAgID0gMHgwRjsKY29uc3RleHByIHVpbnQ4X3QgQ0hJUF9JRCAgICAgICAgPSAweDZDOwpjb25zdGV4cHIgdWludDhfdCBGSUZPX0NUUkwzICAgICA9IDB4MDk7CmNvbnN0ZXhwciB1aW50OF90IEZJRk9fQ1RSTDQgICAgID0gMHgwQTsKY29uc3RleHByIHVpbnQ4X3QgSU5UMV9DVFJMICAgICAgPSAweDBEOwpjb25zdGV4cHIgdWludDhfdCBJTlQyX0NUUkwgICAgICA9IDB4MEU7CmNvbnN0ZXhwciB1aW50OF90IENUUkwxX1hMICAgICAgID0gMHgxMDsKY29uc3RleHByIHVpbnQ4X3QgQ1RSTDJfRyAgICAgICAgPSAweDExOwpjb25zdGV4cHIgdWludDhfdCBDVFJMM19DICAgICAgICA9IDB4MTI7CmNvbnN0ZXhwciB1aW50OF90IENUUkw0X0MgICAgICAgID0gMHgxMzsKY29uc3RleHByIHVpbnQ4X3QgQ1RSTDZfQyAgICAgICAgPSAweDE1Owpjb25zdGV4cHIgdWludDhfdCBDVFJMOV9YTCAgICAgICA9IDB4MTg7CmNvbnN0ZXhwciB1aW50OF90IFNUQVRVU19SRUcgICAgID0gMHgxRTsKY29uc3RleHByIHVpbnQ4X3QgT1VUX1RFTVBfTCAgICAgPSAweDIwOwpjb25zdGV4cHIgdWludDhfdCBPVVRYX0xfRyAgICAgICA9IDB4MjI7CmNvbnN0ZXhwciB1aW50OF90IE9VVFhfTF9BICAgICAgID0gMHgyODsKCmludDE2X3QgdW5wYWNrMTYoY29uc3QgdWludDhfdCAqZGF0YSwgdWludDhfdCBvZmZzZXQpIHsKICAgIHJldHVybiBzdGF0aWNfY2FzdDxpbnQxNl90Pih1aW50MTZfdChkYXRhW29mZnNldF0pIHwKICAgICAgICAodWludDE2X3QoZGF0YVtvZmZzZXQgKyAxXSkgPDwgOCkpOwp9Cn0KCkFQX0luZXJ0aWFsU2Vuc29yX0xTTTZEU086OkFQX0luZXJ0aWFsU2Vuc29yX0xTTTZEU08oCiAgICBBUF9JbmVydGlhbFNlbnNvciAmaW11LCBBUF9IQUw6Ok93blB0cjxBUF9IQUw6OkRldmljZT4gZGV2aWNlLAogICAgZW51bSBSb3RhdGlvbiByb3RhdGlvbikgOiBBUF9JbmVydGlhbFNlbnNvcl9CYWNrZW5kKGltdSksCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGRldihzdGQ6Om1vdmUoZGV2aWNlKSksIHJvdChyb3RhdGlvbikge30KCkFQX0luZXJ0aWFsU2Vuc29yX0JhY2tlbmQgKkFQX0luZXJ0aWFsU2Vuc29yX0xTTTZEU086OnByb2JlKAogICAgQVBfSW5lcnRpYWxTZW5zb3IgJmltdSwgQVBfSEFMOjpPd25QdHI8QVBfSEFMOjpEZXZpY2U+IGRldmljZSwKICAgIGVudW0gUm90YXRpb24gcm90YXRpb24pIHsKICAgIGlmICghZGV2aWNlKSB7IHJldHVybiBudWxscHRyOyB9CiAgICBhdXRvICpzZW5zb3IgPSBORVdfTk9USFJPVyBBUF9JbmVydGlhbFNlbnNvcl9MU002RFNPKAogICAgICAgIGltdSwgc3RkOjptb3ZlKGRldmljZSksIHJvdGF0aW9uKTsKICAgIGlmIChzZW5zb3IgPT0gbnVsbHB0ciB8fCAhc2Vuc29yLT5oYXJkd2FyZV9pbml0KCkpIHsKICAgICAgICBkZWxldGUgc2Vuc29yOwogICAgICAgIHJldHVybiBudWxscHRyOwogICAgfQogICAgcmV0dXJuIHNlbnNvcjsKfQoKYm9vbCBBUF9JbmVydGlhbFNlbnNvcl9MU002RFNPOjpyZWFkX3JlZyh1aW50OF90IHJlZywgdWludDhfdCAmdmFsdWUpIHsKICAgIHJldHVybiBkZXYtPnJlYWRfcmVnaXN0ZXJzKHJlZywgJnZhbHVlLCAxKTsKfQoKYm9vbCBBUF9JbmVydGlhbFNlbnNvcl9MU002RFNPOjp3cml0ZV9yZWcodWludDhfdCByZWcsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHVpbnQ4X3QgdmFsdWUsIGJvb2wgY2hlY2tlZCkgewogICAgcmV0dXJuIGRldi0+d3JpdGVfcmVnaXN0ZXIocmVnLCB2YWx1ZSwgY2hlY2tlZCk7Cn0KCmJvb2wgQVBfSW5lcnRpYWxTZW5zb3JfTFNNNkRTTzo6aGFyZHdhcmVfaW5pdCgpIHsKICAgIFdJVEhfU0VNQVBIT1JFKGRldi0+Z2V0X3NlbWFwaG9yZSgpKTsKICAgIGRldi0+c2V0X3JlYWRfZmxhZygweDgwKTsKICAgIGRldi0+c2V0X3NwZWVkKEFQX0hBTDo6RGV2aWNlOjpTUEVFRF9MT1cpOwogICAgdWludDhfdCB2YWx1ZSA9IDA7CiAgICBpZiAoIXJlYWRfcmVnKFdIT19BTV9JLCB2YWx1ZSkgfHwgdmFsdWUgIT0gQ0hJUF9JRCkgewogICAgICAgIHJldHVybiBmYWxzZTsKICAgIH0KCiAgICAvLyBJc3N1ZSBhbmQgZXhwbGljaXRseSB3YWl0IGZvciB0aGUgU1QgU1dfUkVTRVQgYml0IHRvIGNsZWFyLgogICAgaWYgKCF3cml0ZV9yZWcoQ1RSTDNfQywgMHgwMSkpIHsgcmV0dXJuIGZhbHNlOyB9CiAgICBib29sIHJlc2V0X2RvbmUgPSBmYWxzZTsKICAgIGZvciAodWludDhfdCBpID0gMDsgaSA8IDUwOyBpKyspIHsKICAgICAgICBoYWwuc2NoZWR1bGVyLT5kZWxheSgyKTsKICAgICAgICBpZiAocmVhZF9yZWcoQ1RSTDNfQywgdmFsdWUpICYmICEodmFsdWUgJiAweDAxKSkgewogICAgICAgICAgICByZXNldF9kb25lID0gdHJ1ZTsKICAgICAgICAgICAgYnJlYWs7CiAgICAgICAgfQogICAgfQogICAgaWYgKCFyZXNldF9kb25lIHx8ICFyZWFkX3JlZyhXSE9fQU1fSSwgdmFsdWUpIHx8IHZhbHVlICE9IENISVBfSUQpIHsKICAgICAgICByZXR1cm4gZmFsc2U7CiAgICB9CgogICAgLy8gQmV0YWZsaWdodCdzIGtub3duLWdvb2QgTFNNNkRTTyBzZXR1cCwgYWRhcHRlZCBmb3IgcG9sbGluZy4KICAgIC8vIE5vIEZJRk86IHByb3ZlIHRoYXQgdGhlIGNvcnJlY3QgZGV2aWNlIHByb3ZpZGVzIGJvdGggcmF3IGNoYW5uZWxzLgogICAgZGV2LT5zZXR1cF9jaGVja2VkX3JlZ2lzdGVycygxMCwgMjApOwogICAgaWYgKCF3cml0ZV9yZWcoQ1RSTDNfQywgMHg0NCwgdHJ1ZSkgfHwgLy8gQkRVLCBhdXRvLWluY3JlbWVudAogICAgICAgICF3cml0ZV9yZWcoQ1RSTDRfQywgMHgwNiwgdHJ1ZSkgfHwgLy8gZGlzYWJsZSBJMkMsIGd5cm8gTFBGMQogICAgICAgICF3cml0ZV9yZWcoQ1RSTDZfQywgMHgwMCwgdHJ1ZSkgfHwgLy8gYWNjZWxlcm9tZXRlciBIUCwgZ3lybyBjdXRvZmYKICAgICAgICAhd3JpdGVfcmVnKENUUkw5X1hMLCAweDAyLCB0cnVlKSB8fCAvLyBkaXNhYmxlIEkzQwogICAgICAgICF3cml0ZV9yZWcoSU5UMV9DVFJMLCAweDAwLCB0cnVlKSB8fCAvLyBwb2xsaW5nLCBub3QgSU5UMQogICAgICAgICF3cml0ZV9yZWcoSU5UMl9DVFJMLCAweDAwLCB0cnVlKSB8fAogICAgICAgICF3cml0ZV9yZWcoRklGT19DVFJMMywgMHgwMCwgdHJ1ZSkgfHwKICAgICAgICAhd3JpdGVfcmVnKEZJRk9fQ1RSTDQsIDB4MDAsIHRydWUpIHx8CiAgICAgICAgIXdyaXRlX3JlZyhDVFJMMV9YTCwgMHg3NCwgdHJ1ZSkgfHwgLy8gODMzIEh6LCArLy0xNmcKICAgICAgICAhd3JpdGVfcmVnKENUUkwyX0csIDB4N0MsIHRydWUpKSB7IC8vIDgzMyBIeiwgKy8tMjAwMCBkcHMKICAgICAgICByZXR1cm4gZmFsc2U7CiAgICB9CgogICAgLy8gRG8gbm90IGFkdmVydGlzZSBhIGhlYWx0aHkgSU1VIHVudGlsIEFDQyBhbmQgR1lSTyBEUkRZIGFzc2VydC4KICAgIGJvb2wgYWNjZWxfcmVhZHkgPSBmYWxzZTsKICAgIGJvb2wgZ3lyb19yZWFkeSA9IGZhbHNlOwogICAgZm9yICh1aW50OF90IGkgPSAwOyBpIDwgNDA7IGkrKykgewogICAgICAgIGhhbC5zY2hlZHVsZXItPmRlbGF5KDUpOwogICAgICAgIGlmIChyZWFkX3JlZyhTVEFUVVNfUkVHLCB2YWx1ZSkpIHsKICAgICAgICAgICAgYWNjZWxfcmVhZHkgfD0gKHZhbHVlICYgMHgwMSkgIT0gMDsKICAgICAgICAgICAgZ3lyb19yZWFkeSB8PSAodmFsdWUgJiAweDAyKSAhPSAwOwogICAgICAgICAgICBpZiAoYWNjZWxfcmVhZHkgJiYgZ3lyb19yZWFkeSkgeyBicmVhazsgfQogICAgICAgIH0KICAgIH0KICAgIGRldi0+c2V0X3NwZWVkKEFQX0hBTDo6RGV2aWNlOjpTUEVFRF9ISUdIKTsKICAgIHJldHVybiBhY2NlbF9yZWFkeSAmJiBneXJvX3JlYWR5Owp9Cgp2b2lkIEFQX0luZXJ0aWFsU2Vuc29yX0xTTTZEU086OnN0YXJ0KCkgewogICAgaWYgKCFfaW11LnJlZ2lzdGVyX2d5cm8oZ3lyb19pbnN0YW5jZSwgU0FNUExFX1JBVEUsCiAgICAgICAgICAgICAgICAgICAgICAgICAgIGRldi0+Z2V0X2J1c19pZF9kZXZ0eXBlKERFVlRZUEVfSU5TX0xTTTZEU08pKSB8fAogICAgICAgICFfaW11LnJlZ2lzdGVyX2FjY2VsKGFjY2VsX2luc3RhbmNlLCBTQU1QTEVfUkFURSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGRldi0+Z2V0X2J1c19pZF9kZXZ0eXBlKERFVlRZUEVfSU5TX0xTTTZEU08pKSkgewogICAgICAgIHJldHVybjsKICAgIH0KICAgIHNldF9neXJvX29yaWVudGF0aW9uKGd5cm9faW5zdGFuY2UsIHJvdCk7CiAgICBzZXRfYWNjZWxfb3JpZW50YXRpb24oYWNjZWxfaW5zdGFuY2UsIHJvdCk7CiAgICAvLyBDYWxsYmFjayBldmVyeSBtaWxsaXNlY29uZDsgY2hpcCBvdXRwdXQgbm9taW5hbGx5IDgzM0h6LgogICAgZGV2LT5yZWdpc3Rlcl9wZXJpb2RpY19jYWxsYmFjaygxMDAwLAogICAgICAgIEZVTkNUT1JfQklORF9NRU1CRVIoJkFQX0luZXJ0aWFsU2Vuc29yX0xTTTZEU086OnBvbGxfZGF0YSwgdm9pZCkpOwp9Cgp2b2lkIEFQX0luZXJ0aWFsU2Vuc29yX0xTTTZEU086OnBvbGxfZGF0YSgpIHsKICAgIHVpbnQ4X3Qgc3RhdHVzID0gMDsKICAgIGlmICghcmVhZF9yZWcoU1RBVFVTX1JFRywgc3RhdHVzKSkgewogICAgICAgIF9pbmNfYWNjZWxfZXJyb3JfY291bnQoYWNjZWxfaW5zdGFuY2UpOwogICAgICAgIF9pbmNfZ3lyb19lcnJvcl9jb3VudChneXJvX2luc3RhbmNlKTsKICAgICAgICByZXR1cm47CiAgICB9CiAgICBjb25zdCB1aW50NjRfdCBzYW1wbGVfdXMgPSBBUF9IQUw6Om1pY3JvczY0KCk7CiAgICB1aW50OF90IHJhd1s2XSA9IHt9OwogICAgaWYgKHN0YXR1cyAmIDB4MDIpIHsKICAgICAgICBpZiAoZGV2LT5yZWFkX3JlZ2lzdGVycyhPVVRYX0xfRywgcmF3LCBzaXplb2YocmF3KSkpIHsKICAgICAgICAgICAgVmVjdG9yM2YgZ3lybyh1bnBhY2sxNihyYXcsIDApLCB1bnBhY2sxNihyYXcsIDIpLCB1bnBhY2sxNihyYXcsIDQpKTsKICAgICAgICAgICAgZ3lybyAqPSBHWVJPX1NDQUxFOwogICAgICAgICAgICBfcm90YXRlX2FuZF9jb3JyZWN0X2d5cm8oZ3lyb19pbnN0YW5jZSwgZ3lybyk7CiAgICAgICAgICAgIF9ub3RpZnlfbmV3X2d5cm9fcmF3X3NhbXBsZShneXJvX2luc3RhbmNlLCBneXJvLCBzYW1wbGVfdXMpOwogICAgICAgIH0gZWxzZSB7CiAgICAgICAgICAgIF9pbmNfZ3lyb19lcnJvcl9jb3VudChneXJvX2luc3RhbmNlKTsKICAgICAgICB9CiAgICB9CiAgICBpZiAoc3RhdHVzICYgMHgwMSkgewogICAgICAgIGlmIChkZXYtPnJlYWRfcmVnaXN0ZXJzKE9VVFhfTF9BLCByYXcsIHNpemVvZihyYXcpKSkgewogICAgICAgICAgICBWZWN0b3IzZiBhY2NlbCh1bnBhY2sxNihyYXcsIDApLCB1bnBhY2sxNihyYXcsIDIpLCB1bnBhY2sxNihyYXcsIDQpKTsKICAgICAgICAgICAgYWNjZWwgKj0gQUNDRUxfU0NBTEU7CiAgICAgICAgICAgIF9yb3RhdGVfYW5kX2NvcnJlY3RfYWNjZWwoYWNjZWxfaW5zdGFuY2UsIGFjY2VsKTsKICAgICAgICAgICAgX25vdGlmeV9uZXdfYWNjZWxfcmF3X3NhbXBsZShhY2NlbF9pbnN0YW5jZSwgYWNjZWwsIHNhbXBsZV91cyk7CiAgICAgICAgfSBlbHNlIHsKICAgICAgICAgICAgX2luY19hY2NlbF9lcnJvcl9jb3VudChhY2NlbF9pbnN0YW5jZSk7CiAgICAgICAgfQogICAgfQogICAgaWYgKCsrdGVtcF9jb3VudGVyID49IDIwKSB7CiAgICAgICAgdWludDhfdCB0bXBbMl0gPSB7fTsKICAgICAgICBpZiAoZGV2LT5yZWFkX3JlZ2lzdGVycyhPVVRfVEVNUF9MLCB0bXAsIHNpemVvZih0bXApKSkgewogICAgICAgICAgICB0ZW1wZXJhdHVyZV9kZWdjID0gMjUuMGYgKyBmbG9hdCh1bnBhY2sxNih0bXAsIDApKSAvIDI1Ni4wZjsKICAgICAgICB9CiAgICAgICAgdGVtcF9jb3VudGVyID0gMDsKICAgIH0KICAgIEFQX0hBTDo6RGV2aWNlOjpjaGVja3JlZyBjaGVjazsKICAgIGlmICghZGV2LT5jaGVja19uZXh0X3JlZ2lzdGVyKGNoZWNrKSkgewogICAgICAgIGxvZ19yZWdpc3Rlcl9jaGFuZ2UoZGV2LT5nZXRfYnVzX2lkKCksIGNoZWNrKTsKICAgICAgICBfaW5jX2FjY2VsX2Vycm9yX2NvdW50KGFjY2VsX2luc3RhbmNlKTsKICAgIH0KfQoKYm9vbCBBUF9JbmVydGlhbFNlbnNvcl9MU002RFNPOjp1cGRhdGUoKSB7CiAgICB1cGRhdGVfZ3lybyhneXJvX2luc3RhbmNlKTsKICAgIHVwZGF0ZV9hY2NlbChhY2NlbF9pbnN0YW5jZSk7CiAgICBfcHVibGlzaF90ZW1wZXJhdHVyZShhY2NlbF9pbnN0YW5jZSwgdGVtcGVyYXR1cmVfZGVnYyk7CiAgICByZXR1cm4gdHJ1ZTsKfQo='))
+
+          # Connect new driver to generated HAL_INS_PROBE_LIST and give it a unique device ID.
+          replace_once(ins/'AP_InertialSensor.cpp',
+              '#include "AP_InertialSensor_ASM330.h"',
+              '#include "AP_InertialSensor_ASM330.h"\n#include "AP_InertialSensor_LSM6DSO.h"')
+          replace_once(ins/'AP_InertialSensor_Backend.h',
+              'DEVTYPE_INS_ADIS16607 = 0x40,',
+              'DEVTYPE_INS_ADIS16607 = 0x40,\n        DEVTYPE_INS_LSM6DSO = 0x41,')
+
+          board=root/'libraries/AP_HAL_ChibiOS/hwdef/speedybeef4v4/hwdef.dat'
+          replace_once(board,
+              '# for SPEEDYBEEF405V4 hardware.',
+              '# EXPERIMENTAL VYRIY F405 V5.1: standalone LSM6DSO backend, NOT flight tested.\n'
+              '# Temporary SpeedyBee V4 board ID / bootloader retained (NOT verified VYRIY compatibility).')
+          replace_once(board,
+              'PC9 TIM8_CH4 TIM8 PWM(6) GPIO(55)        # M6',
+              'PB15 TIM12_CH2 TIM12 PWM(6) GPIO(55) NODMA # VYRIY SERVO1')
+          replace_once(board,
+              'PC8 TIM8_CH3 TIM8 PWM(5) GPIO(54)        # M5',
+              'PC8 TIM8_CH3 TIM8 PWM(5) GPIO(54) # VYRIY SERVO2')
+          replace_once(board,
+              'define AP_BARO_SPL06_ENABLED 1',
+              'define AP_BARO_DPS280_ENABLED 1')
+          replace_once(board,
+              'BARO SPL06 I2C:0:0x76',
+              'BARO DPS310 I2C:0:0x76')
+          replace_once(board,
+              'IMU Invensensev3 SPI:imu1 ROTATION_PITCH_180_YAW_270',
+              '# LSM6DSO uses its own driver; ROTATION_NONE is only provisional.\n'
+              'IMU LSM6DSO SPI:imu1 ROTATION_NONE')
+          print('LSM6DSO source installed, hwdef patched')
+          PYCODE
+          python3 /tmp/vyriy_lsm6dso_patch.py
+          git -C ardupilot diff -- libraries/AP_InertialSensor/AP_InertialSensor.cpp libraries/AP_InertialSensor/AP_InertialSensor_Backend.h libraries/AP_HAL_ChibiOS/hwdef/speedybeef4v4/hwdef.dat > logs/modified-existing-files.patch
+          cp ardupilot/libraries/AP_InertialSensor/AP_InertialSensor_LSM6DSO.* logs/
+
+      - name: Configure and compile bench firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "$HOME/venv-ardupilot/bin/activate" ]; then source "$HOME/venv-ardupilot/bin/activate"; fi
+          cd ardupilot
+          (./waf configure --board speedybeef4v4 && ./waf copter) 2>&1 | tee ../logs/build.log
+          test -s build/speedybeef4v4/bin/arducopter.apj
+
+      - name: Collect firmware (NO bootloader HEX)
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p firmware
+          cp ardupilot/build/speedybeef4v4/bin/arducopter.apj firmware/
+          cp ardupilot/build/speedybeef4v4/bin/arducopter.bin firmware/
+          cat > firmware/READ_ME_BEFORE_FLASHING.txt <<'EOF'
+          EXPERIMENTAL VYRIY F405 V5.1 LSM6DSO BENCH firmware.
+          Dedicated LSM6DSO SPI driver (WHOAMI 0x6C, 833Hz gyro/accel, direct-register polling).
+          NOT flight-tested or verified on actual hardware. NO FLYING.
+          RETAINS SPEEDYBEE F405 V4 APJ BOARD ID AND BOOTLOADER LAYOUT.
+          NEVER FLASH THE SPEEDYBEE BOOTLOADER TO VYRIY.
+          Validate actual bootloader / flash layout before ANY flash.
+          Board rotation ROTATION_NONE IS UNVERIFIED. NO PROPELLERS.
+          Backup current full flash and bootloader before testing.
+          EOF
+          sha256sum firmware/arducopter.* > firmware/SHA256SUMS.txt
+
+      - name: Upload firmware
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VYRIY-F405V51-LSM6DSO-BENCH-ONLY
+          path: firmware/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VYRIY-LSM6DSO-build-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 30
