@@ -1,0 +1,179 @@
+name: Experimental VYRIY F405 V5.1 ArduCopter 4.7.2
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-vyriy-dma.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Fetch ArduPilot Copter-4.7.2 and submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          git clone --branch Copter-4.7.2 --depth 1 https://github.com/ArduPilot/ardupilot.git ardupilot
+          cd ardupilot
+          git submodule update --init --recursive
+          git rev-parse HEAD | tee ../logs/source-commit.txt
+
+      - name: Install ArduPilot prerequisites and ARM toolchain
+        shell: bash
+        env:
+          DO_AP_STM_ENV: '1'
+          DO_PYTHON_VENV_ENV: '1'
+          SKIP_AP_COMPLETION_ENV: '1'
+          SKIP_AP_GIT_CHECK: '1'
+        run: |
+          set -euo pipefail
+          cd ardupilot
+          bash Tools/environment_install/install-prereqs-ubuntu.sh -y 2>&1 | tee ../logs/prerequisites.log
+          compiler=$(find "$HOME/opt" /opt -type f -name arm-none-eabi-gcc -print -quit 2>/dev/null || true)
+          if [ -z "$compiler" ]; then compiler=$(command -v arm-none-eabi-gcc || true); fi
+          if [ -z "$compiler" ]; then echo 'ARM compiler not found' >&2; exit 1; fi
+          echo "$(dirname "$compiler")" >> "$GITHUB_PATH"
+          echo "Compiler: $compiler"
+          "$compiler" --version | head -n 1
+
+      - name: Patch board hardware and experimental LSM6DSO probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/apply_vyriy_f405v51.py <<'PYCODE'
+          #!/usr/bin/env python3
+          """Experimental ArduPilot 4.7.2 source adaptations for VYRIY F405 V5.1 (LSM6DSO).
+
+          USAGE: python3 apply_vyriy_f405v51.py /path/to/ardupilot
+          Requires a full, checked-out ArduPilot source tree. Makes backups and aborts on
+          unknown source layouts. This is a prototype, NOT hardware-validated firmware.
+          """
+          from pathlib import Path
+          import difflib
+          import sys
+
+          if len(sys.argv) != 2:
+              raise SystemExit('Usage: python3 apply_vyriy_f405v51.py /path/to/ardupilot')
+          root = Path(sys.argv[1]).expanduser().resolve()
+          board = root / 'libraries/AP_HAL_ChibiOS/hwdef/speedybeef4v4/hwdef.dat'
+          driver = root / 'libraries/AP_InertialSensor/AP_InertialSensor_ASM330.cpp'
+
+          # Replace only exact, verified upstream source lines. Stop when any line differs.
+          changes = {
+              board: [
+                  ('# for SPEEDYBEEF405V4 hardware.',
+                   '# EXPERIMENTAL VYRIY F405 V5.1 variant based on SPEEDYBEEF405V4.\n'
+                   '# GPIO verified against VYRIYF4V5 Betaflight 4.5.4 resource dump.\n'
+                   '# NOT tested on hardware. Retains SpeedyBee V4 APJ board ID.'),
+                  ('PC9 TIM8_CH4 TIM8 PWM(6) GPIO(55)        # M6',
+                   '# PC9 is PINIO1 on VYRIY: do not drive it as an ESC/servo output.\n'
+                   '# The actual VYRIY SERVO1 output is PB15 / TIM12_CH2.\n'
+                   'PB15 TIM12_CH2 TIM12 PWM(6) GPIO(55) NODMA # VYRIY SERVO1'),
+                  ('PC8 TIM8_CH3 TIM8 PWM(5) GPIO(54)        # M5',
+                   'PC8 TIM8_CH3 TIM8 PWM(5) GPIO(54) # VYRIY SERVO2'),
+                  ('define AP_BARO_SPL06_ENABLED 1',
+                   'define AP_BARO_DPS280_ENABLED 1'),
+                  ('BARO SPL06 I2C:0:0x76',
+                   'BARO DPS310 I2C:0:0x76 # Validate address and pressure in Mission Planner'),
+                  ('IMU Invensensev3 SPI:imu1 ROTATION_PITCH_180_YAW_270',
+                   '# LSM6DSO WHO_AM_I=0x6C: use experimental ASM330-family backend.\n'
+                   '# ROTATION_NONE is provisional, derived from Betaflight gyro_1_sensor_align=CW0.\n'
+                   '# Verify live roll/pitch/yaw, accel signs and board mounting BEFORE arming.\n'
+                   'IMU ASM330 SPI:imu1 ROTATION_NONE'),
+              ],
+              driver: [
+                  ('if (whoami != WHO_AM_I) {',
+                   '// Experimental compatibility: LSM6DSO reports 0x6C, ASM330LHH 0x6B.\n'
+                   '    // Similar register/FIFO layout is not proof of flight safety.\n'
+                   '    if (whoami != WHO_AM_I && whoami != 0x6C) {'),
+              ],
+          }
+
+          out = []
+          for file, replacements in changes.items():
+              if not file.is_file():
+                  raise SystemExit(f'STOP: missing upstream file {file}; check repository and branch')
+              original = file.read_text(encoding='utf-8')
+              modified = original
+              for old, new in replacements:
+                  hits = modified.count(old)
+                  if hits != 1:
+                      raise SystemExit(f'STOP: expected 1 occurrence of {old!r} in {file}, got {hits}. No files changed.')
+                  modified = modified.replace(old, new, 1)
+              out.append((file, original, modified))
+
+          # Only write after all matches succeed. Source originals get .pre_vyriy_backup files.
+          for file, old, new in out:
+              backup = file.with_name(file.name + '.pre_vyriy_backup')
+              if backup.exists():
+                  raise SystemExit(f'STOP: backup already exists {backup}; refusing to overwrite')
+          for file, old, new in out:
+              backup = file.with_name(file.name + '.pre_vyriy_backup')
+              backup.write_text(old, encoding='utf-8')
+              file.write_text(new, encoding='utf-8')
+              print('Updated:', file.relative_to(root))
+              print('Backup: ', backup.relative_to(root))
+              print(''.join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
+                   fromfile=str(file.relative_to(root))+'.upstream', tofile=str(file.relative_to(root))+'.vyriy')))
+          print('Source adapted. NOT compiled, NOT flashed, NOT flight-tested.')
+          PYCODE
+          python3 /tmp/apply_vyriy_f405v51.py ./ardupilot 2>&1 | tee logs/patch.log
+          grep -n 'IMU ASM330 SPI:imu1' ardupilot/libraries/AP_HAL_ChibiOS/hwdef/speedybeef4v4/hwdef.dat
+          grep -n 'whoami != WHO_AM_I && whoami != 0x6C' ardupilot/libraries/AP_InertialSensor/AP_InertialSensor_ASM330.cpp
+          git -C ardupilot diff -- libraries/AP_HAL_ChibiOS/hwdef/speedybeef4v4/hwdef.dat libraries/AP_InertialSensor/AP_InertialSensor_ASM330.cpp > logs/source-changes.patch
+
+      - name: Configure and compile ArduCopter (experimental)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "$HOME/venv-ardupilot/bin/activate" ]; then source "$HOME/venv-ardupilot/bin/activate"; fi
+          cd ardupilot
+          (./waf configure --board speedybeef4v4 && ./waf copter) 2>&1 | tee ../logs/build.log
+          echo 'Built files:'
+          find build/speedybeef4v4/bin -maxdepth 1 -type f -print
+          test -s build/speedybeef4v4/bin/arducopter.apj
+
+      - name: Collect compiled outputs
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p firmware
+          cp ardupilot/build/speedybeef4v4/bin/arducopter.apj firmware/
+          for f in ardupilot/build/speedybeef4v4/bin/*.hex ardupilot/build/speedybeef4v4/bin/*.bin; do
+            if [ -f "$f" ]; then cp "$f" firmware/; fi
+          done
+          sha256sum firmware/* | tee firmware/SHA256SUMS.txt
+          cat > firmware/EXPERIMENTAL_DO_NOT_FLASH_FOR_FLIGHT.txt <<'EOF'
+          EXPERIMENTAL VYRIY F405 V5.1 / LSM6DSO: NO hardware validation.
+          This is compiled for SpeedyBee V4 board ID. Compiling is not a functional test.
+          Do not fly this firmware. Bench-test sensor FIFO, axes, barometer,
+          motor outputs, UART, safety behavior, and bootloader matching first.
+          EOF
+
+      - name: Upload firmware only if compilation succeeded
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VYRIY-F405-V5.1-EXPERIMENTAL-FIRMWARE
+          path: firmware/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostics, even if failed
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VYRIY-build-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 30
